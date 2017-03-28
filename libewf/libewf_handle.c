@@ -64,6 +64,16 @@
 #include "ewf_definitions.h"
 #include "ewf_file_header.h"
 
+#include "uthash.h"
+
+#define HASH_ADD_OFF(head,offfiled,add)                                          \
+    HASH_ADD(hh,head,offfiled,sizeof(off64_t),add)
+#define HASH_FIND_OFF(head,offfiled,add)                                          \
+    HASH_FIND(hh,head,offfiled,sizeof(off64_t),add)
+
+#define CACHE_BUFFER_SIZE 131072
+#define CACHE_CAPACITY 1024
+
 /* Initialize the handle
  * The handle must point to a NULL pointer to be allocated
  * Returns 1 if successful or -1 on error
@@ -4678,10 +4688,52 @@ ssize_t libewf_handle_read_chunk(
 	return( (ssize_t) read_size );
 }
 
+
+
+struct CacheEntry {
+	off64_t key;
+	uint8_t *value;
+	UT_hash_handle hh;
+};
+static struct CacheEntry *cache = NULL;
+
+static uint8_t* find_in_cache(off64_t key)
+{
+	struct CacheEntry *entry;
+	HASH_FIND_OFF(cache, &key, entry);
+	if (entry) {
+		// remove it (so the subsequent add will throw it on the front of the list)
+		HASH_DELETE(hh, cache, entry);
+		HASH_ADD_OFF(cache, key, entry);
+		return entry->value;
+	}
+	return NULL;
+}
+
+static void add_to_cache(off64_t key, uint8_t *value)
+{
+	struct CacheEntry *entry, *tmp_entry;
+	entry = malloc(sizeof(struct CacheEntry));
+	entry->key = key;
+	entry->value = value;
+	HASH_ADD_OFF(cache, key, entry);
+
+	// prune the cache to CACHE_CAPACITY
+	if (HASH_COUNT(cache) >= CACHE_CAPACITY) {
+		HASH_ITER(hh, cache, entry, tmp_entry) {
+			// prune the first entry (loop is based on insertion order so this deletes the oldest item)
+			HASH_DELETE(hh, cache, entry);
+			free(entry->value);
+			free(entry);
+			break;
+		}
+	}
+}
+
 /* Reads (media) data at the current offset into a buffer
  * Returns the number of bytes read or -1 on error
  */
-ssize_t libewf_handle_read_buffer(
+ssize_t __libewf_handle_read_buffer(
          libewf_handle_t *handle,
          void *buffer,
          size_t buffer_size,
@@ -4689,7 +4741,7 @@ ssize_t libewf_handle_read_buffer(
 {
 	libewf_chunk_data_t *chunk_data           = NULL;
 	libewf_internal_handle_t *internal_handle = NULL;
-	static char *function                     = "libewf_handle_read_buffer";
+	static char *function                     = "__libewf_handle_read_buffer";
 	off64_t chunk_offset                      = 0;
 	size_t buffer_offset                      = 0;
 	size_t read_size                          = 0;
@@ -4913,6 +4965,100 @@ ssize_t libewf_handle_read_buffer(
 	}
 	return( total_read_count );
 }
+
+
+static uint8_t* __libewf_get_buffer(libewf_handle_t *handle,
+	off64_t offset,
+	libcerror_error_t **error)
+{
+	static char *function = "__libewf_get_buffer";
+	ssize_t cnt;
+
+	uint8_t* buf = find_in_cache(offset);
+	if (buf != NULL) {
+		return buf;
+	}
+
+	buf = malloc(CACHE_BUFFER_SIZE);
+	add_to_cache(offset, buf);
+	if (libewf_handle_seek_offset(
+		handle,
+		offset,
+		SEEK_SET,
+		error) == -1)
+	{
+		libcerror_error_set(
+			error,
+			LIBCERROR_ERROR_DOMAIN_IO,
+			LIBCERROR_IO_ERROR_SEEK_FAILED,
+			"%s: unable to seek offset after cached read.",
+			function);
+
+		return 0;
+	}
+	cnt = __libewf_handle_read_buffer(handle, buf, CACHE_BUFFER_SIZE, error);
+	/*if (cnt < 0) {
+	} set error here*/
+	return buf;
+}
+
+
+/* Reads (media) data at the current offset into a buffer
+* Returns the number of bytes read or -1 on error
+*/
+ssize_t libewf_handle_read_buffer(
+	libewf_handle_t *handle,
+	void *buffer,
+	size_t buffer_size,
+	libcerror_error_t **error) 
+{
+	libewf_internal_handle_t *internal_handle = (libewf_internal_handle_t *)handle;
+	off64_t offset = internal_handle->io_handle->current_offset;
+	static char *function = "libewf_handle_read_buffer";
+
+	off64_t off_off = offset % CACHE_BUFFER_SIZE;
+	off64_t off_ini = offset - off_off;
+
+	ssize_t already_read = 0;
+	ssize_t to_read = buffer_size;
+	ssize_t to_read_now;
+	while (to_read > 0) {
+		to_read_now = to_read;
+		if (to_read_now > CACHE_BUFFER_SIZE - off_off)
+			to_read_now = CACHE_BUFFER_SIZE - off_off;
+		uint8_t* cached_buffer = __libewf_get_buffer(handle, off_ini, error);
+		if (cached_buffer == NULL)
+			return -1;
+
+		memory_copy(
+			(((uint8_t*) buffer) + already_read),
+			(cached_buffer + off_off),
+			to_read_now);
+		already_read += to_read_now;
+		to_read -= to_read_now;
+		off_off = 0;
+		off_ini += CACHE_BUFFER_SIZE;
+	}
+
+	if (libewf_handle_seek_offset(
+		handle,
+		offset + already_read,
+		SEEK_SET,
+		error) == -1)
+	{
+		libcerror_error_set(
+			error,
+			LIBCERROR_ERROR_DOMAIN_IO,
+			LIBCERROR_IO_ERROR_SEEK_FAILED,
+			"%s: unable to seek offset after cached read.",
+			function);
+
+		return 0;
+	}
+
+	return already_read;
+}
+
 
 /* Reads (media) data at a specific offset
  * Returns the number of bytes read or -1 on error
