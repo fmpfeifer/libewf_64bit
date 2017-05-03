@@ -163,6 +163,8 @@ struct libewf_internal_handle
 	/* The single files
 	 */
 	libewf_single_files_t *single_files;
+
+	intptr_t *cache;
 };
 
 LIBEWF_EXTERN \
