@@ -4724,7 +4724,7 @@ static void add_to_cache(libewf_handle_t *handle, off64_t key, uint8_t *value)
 	
 
 	// prune the cache to CACHE_CAPACITY
-	if (HASH_COUNT(cache) >= CACHE_CAPACITY) {
+	while (HASH_COUNT(cache) > CACHE_CAPACITY) {
 		HASH_ITER(hh, cache, entry, tmp_entry) {
 			// prune the first entry (loop is based on insertion order so this deletes the oldest item)
 			HASH_DELETE(hh, cache, entry);
